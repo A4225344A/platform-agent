@@ -78,6 +78,7 @@ jobs:
 
           {
             echo "image=${image}"
+            echo "tag=sha-${short_sha}"
             echo "tags<<EOF"
             echo "${tags}"
             echo "EOF"
@@ -103,3 +104,40 @@ jobs:
           tags: ${{ steps.image.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Checkout GitOps repo
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/checkout@v6
+        with:
+          repository: A4225344A/platform-gitops
+          ref: main
+          token: ${{ secrets.GITOPS_PUSH_TOKEN }}
+          path: platform-gitops
+
+      - name: Update GitOps image tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}:${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          file="platform-gitops/apps/ai-agent.yaml"
+          perl -0pi -e 's#image:\s*ghcr\.io/[^\s]+/ai-agent:\S+#image: '"${IMAGE}"'#' "${file}"
+
+          if ! grep -q "image: ${IMAGE}" "${file}"; then
+            echo "Failed to update ${file}" >&2
+            exit 1
+          fi
+
+          cd platform-gitops
+          if git diff --quiet -- apps/ai-agent.yaml; then
+            echo "GitOps image already ${IMAGE}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/ai-agent.yaml
+          git commit -m "Deploy ai-agent ${GITHUB_SHA::12}"
+          git push origin HEAD:main
