@@ -1,16 +1,13 @@
+.git/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.pip-audit-cache/
-.pip-tools-cache/
 .venv/
-.venv311/
 venv/
 dist/
 build/
 *.egg-info/
 .env
 .env.*
-!.env.example

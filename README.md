@@ -13,17 +13,41 @@ from version control.
 ## Layout
 
 ```text
+Dockerfile
+requirements.in
+requirements.lock
 src/
+  agent.py
   genai_semconv.py
 ```
 
-Future agent runtime files from the runbook, including `agent.py`,
-`requirements.in`, and `requirements.lock`, should be added here in the same
-deployment-oriented shape unless the service is later converted into a reusable
-Python package.
+`requirements.lock` is generated from `requirements.in` with hash pinning in a
+Python 3.11 environment that matches the Docker image.
 
-## Current scope
+## Current Scope
 
-- `genai_semconv.py` isolates OpenTelemetry GenAI semantic convention strings.
-- The mapping layer keeps unstable `gen_ai.*` names in one place so future
-  convention changes do not spread across agent logic.
+- `agent.py` receives Alertmanager webhooks and processes queued alerts.
+- `genai_semconv.py` isolates unstable OpenTelemetry GenAI attribute names.
+- `Dockerfile` builds the deployable agent image from `src/`.
+
+## Generate Lock File
+
+```bash
+python -m pip install --upgrade pip-tools==7.6.1 pip-audit==2.10.1
+pip-compile --generate-hashes --output-file requirements.lock requirements.in
+python -m pip install --require-hashes -r requirements.lock
+python -m pip check
+pip-audit -r requirements.lock
+```
+
+## Run Locally
+
+The agent expects Kubernetes, Postgres, Prometheus, Presidio, LiteLLM, and OTel
+endpoints through environment variables. In normal use it should run in the
+cluster with the GitOps manifest from the runbook.
+
+For a local syntax check:
+
+```bash
+python -m py_compile src/agent.py src/genai_semconv.py
+```
