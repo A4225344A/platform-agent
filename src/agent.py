@@ -95,15 +95,17 @@ tracer = otel_trace.get_tracer("w3.agent")
 # 需要明確建立 Logs SDK bridge:logging -> LoggingHandler -> OTLPLogExporter。
 log_provider = LoggerProvider(resource=otel_resource)
 set_logger_provider(log_provider)
-log_provider.add_log_record_processor(
-    BatchLogRecordProcessor(OTLPLogExporter())   # 讀 OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
-)
+log_handlers = [logging.StreamHandler()]         # 保留 kubectl logs
+if os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"):
+    log_provider.add_log_record_processor(
+        BatchLogRecordProcessor(OTLPLogExporter())   # 讀 OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+    )
+    log_handlers.append(
+        LoggingHandler(level=logging.INFO, logger_provider=log_provider)
+    )
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(),                 # 保留 kubectl logs
-        LoggingHandler(level=logging.INFO, logger_provider=log_provider),
-    ],
+    handlers=log_handlers,
 )
 log = logging.getLogger("agent")
 
@@ -116,6 +118,17 @@ class RemediationAction(BaseModel):
     replicas: Optional[int] = Field(default=None, ge=1, le=10)
 
 
+def _strip_bedrock_unsupported_schema_keywords(value):
+    if isinstance(value, dict):
+        for key in ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"):
+            value.pop(key, None)
+        for child in value.values():
+            _strip_bedrock_unsupported_schema_keywords(child)
+    elif isinstance(value, list):
+        for child in value:
+            _strip_bedrock_unsupported_schema_keywords(child)
+
+
 def response_format():
     """把同一份 Pydantic Schema 轉成模型的解碼約束。
 
@@ -126,6 +139,7 @@ def response_format():
     """
     schema = RemediationAction.model_json_schema()
     schema["additionalProperties"] = False
+    _strip_bedrock_unsupported_schema_keywords(schema)
     return {"type": "json_schema",
             "json_schema": {"name": "remediation_action",
                             "strict": True, "schema": schema}}
@@ -715,6 +729,9 @@ def call_llm(prompt, schema=None):
             headers={"Authorization": f"Bearer {LITELLM_KEY}"},
             json=body, timeout=60,
         )
+        if not r.ok:
+            log.error("LiteLLM chat failed: status=%s body=%s",
+                      r.status_code, r.text[:1000])
         r.raise_for_status()
         data = r.json()
         usage = data.get("usage", {}) or {}
