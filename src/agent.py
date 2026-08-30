@@ -646,10 +646,10 @@ def keyword_query(text, alertname, limit=10):
 
 HYBRID_SQL = """
 WITH vec AS (
-  SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> %(v)s) AS rnk
+  SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> CAST(%(v)s AS vector)) AS rnk
   FROM incidents
   WHERE embedding IS NOT NULL AND outcome IN ('verified','human')
-  ORDER BY embedding <=> %(v)s LIMIT 20
+  ORDER BY embedding <=> CAST(%(v)s AS vector) LIMIT 20
 ),
 kw AS (
   SELECT id, ROW_NUMBER() OVER (
@@ -681,8 +681,9 @@ def hybrid_search(keywords, vec):
     的欄位。上面的 `* i.trust_weight` 是這個落差的修法——一行,但少了
     它,任務 10.4 那句話裡的「真正來源」四個字就是不成立的。
     """
+    vector_literal = "[" + ",".join(str(x) for x in vec) + "]"
     with closing(db()) as conn, conn, conn.cursor() as cur:
-        cur.execute(HYBRID_SQL, {"v": vec, "q": keywords})
+        cur.execute(HYBRID_SQL, {"v": vector_literal, "q": keywords})
         return cur.fetchall()
 
 
