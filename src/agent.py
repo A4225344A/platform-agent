@@ -456,7 +456,7 @@ def resolve_deployment(name):
     return name
 
 
-def fetch_logs(deployment, tail_lines=500, previous=False):
+def fetch_logs(deployment, tail_lines=100, previous=False):
     """用 Deployment 自己的 selector 找 Pod,不猜 label。
 
     v6.1:tail_lines 從 100 提高到 500,並新增 previous 參數 ——
