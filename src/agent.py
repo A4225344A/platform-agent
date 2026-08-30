@@ -430,6 +430,18 @@ def _deployment_from_pod(pod):
     return None
 
 
+def _deployment_from_pod_name(name):
+    match = re.match(r"^(.+)-[a-f0-9]{9,10}-[a-z0-9]{5}$", name or "")
+    if not match:
+        return None
+    candidate = match.group(1)
+    try:
+        apps_v1.read_namespaced_deployment(candidate, NAMESPACE)
+        return candidate
+    except Exception:
+        return None
+
+
 def resolve_deployment(name):
     """把 Alertmanager 的 service identity 收斂成 Deployment 名。
 
@@ -453,6 +465,10 @@ def resolve_deployment(name):
             return dep
     except Exception:
         pass
+
+    dep = _deployment_from_pod_name(name)
+    if dep:
+        return dep
 
     try:
         svc = core_v1.read_namespaced_service(name, NAMESPACE)
@@ -849,10 +865,11 @@ def remediate(act):
 
 
 def verify(deployment, wait=None, incident_id=None):
-    """修復後驗證(Lab readiness proxy):等 wait 秒,確認 Deployment 至少有 Pod Ready。
+    """修復後驗證:等 wait 秒,確認 Deployment 新版 rollout 已完成。
 
-    刻意不用 kube_pod_labels{label_app=...} —— kube-state-metrics 預設不輸出
-    label_* 系列(需開 --metric-labels-allowlist),那樣寫會永遠回 False。
+    只看「至少有 Pod Ready」會把舊 ReplicaSet 的健康 Pod 誤判成修復成功。
+    任務 8.2 這類 GitOps spec 仍然故障的場景,舊 Pod 可能繼續服務,
+    但新版 ReplicaSet 正在 CrashLoop;這必須判定為 failed。
 
     v7 新增 incident_id:由這個函式自己寫時間軸的 verified 步驟,而不是
     在 diagnose() 裡重組同一份 PromQL 再存一次 —— 那會讓查詢字串在兩個
@@ -861,19 +878,47 @@ def verify(deployment, wait=None, incident_id=None):
     """
     waited = VERIFY_WAIT if wait is None else wait
     time.sleep(waited)
-    q = (f'count(kube_pod_status_ready{{namespace="{NAMESPACE}",'
-         f'condition="true",pod=~"{deployment}-.*"}} == 1)')
+    detail = {"waited_seconds": waited}
     try:
-        r = requests.get(f"{PROM_URL}/api/v1/query",
-                         params={"query": q}, timeout=15)
-        r.raise_for_status()
-        result = r.json().get("data", {}).get("result", [])
-        ok = bool(result) and float(result[0]["value"][1]) > 0
+        dep = apps_v1.read_namespaced_deployment(deployment, NAMESPACE)
+        desired = dep.spec.replicas or 1
+        status = dep.status
+        conditions = {c.type: c for c in (status.conditions or [])}
+        progressing = conditions.get("Progressing")
+        available_cond = conditions.get("Available")
+        observed = status.observed_generation or 0
+        generation = dep.metadata.generation or 0
+        updated = status.updated_replicas or 0
+        ready = status.ready_replicas or 0
+        available = status.available_replicas or 0
+        unavailable = status.unavailable_replicas or 0
+
+        detail.update({
+            "desired_replicas": desired,
+            "generation": generation,
+            "observed_generation": observed,
+            "updated_replicas": updated,
+            "ready_replicas": ready,
+            "available_replicas": available,
+            "unavailable_replicas": unavailable,
+            "progressing_status": getattr(progressing, "status", None),
+            "progressing_reason": getattr(progressing, "reason", None),
+            "available_status": getattr(available_cond, "status", None),
+        })
+        ok = (
+            observed >= generation and
+            updated >= desired and
+            ready >= desired and
+            available >= desired and
+            unavailable == 0 and
+            getattr(progressing, "status", None) != "False"
+        )
     except Exception as exc:
         log.warning("verify failed: %s", exc)
+        detail["error"] = str(exc)
         ok = False
-    step(incident_id, "verified",
-         {"passed": ok, "waited_seconds": waited, "query": q})
+    detail["passed"] = ok
+    step(incident_id, "verified", detail)
     return ok
 
 
