@@ -1,6 +1,7 @@
 name: CI/CD
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     tags: ["v*"]
@@ -106,7 +107,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Checkout GitOps repo
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         uses: actions/checkout@v6
         with:
           repository: A4225344A/platform-gitops
@@ -115,7 +116,7 @@ jobs:
           path: platform-gitops
 
       - name: Update GitOps image tag
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         shell: bash
         env:
           IMAGE: ${{ steps.image.outputs.image }}:${{ steps.image.outputs.tag }}
