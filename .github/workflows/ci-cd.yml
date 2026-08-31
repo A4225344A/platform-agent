@@ -43,7 +43,7 @@ jobs:
         run: pip-audit --cache-dir .pip-audit-cache -r requirements.lock
 
       - name: Compile Python files
-        run: python -m py_compile src/agent.py src/genai_semconv.py scripts/smoke_import.py
+        run: python -m py_compile src/agent.py src/genai_semconv.py scripts/smoke_import.py eval_judge.py
 
       - name: Import smoke test
         run: python scripts/smoke_import.py
@@ -115,25 +115,31 @@ jobs:
           token: ${{ secrets.GITOPS_PUSH_TOKEN }}
           path: platform-gitops
 
-      - name: Update GitOps image tag
+      - name: Update GitOps image tag and agent version
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         shell: bash
         env:
           IMAGE: ${{ steps.image.outputs.image }}:${{ steps.image.outputs.tag }}
+          AGENT_VERSION: ${{ steps.image.outputs.tag }}
         run: |
           set -euo pipefail
 
           file="platform-gitops/apps/ai-agent.yaml"
           perl -0pi -e 's#image:\s*ghcr\.io/[^\s]+/ai-agent:\S+#image: '"${IMAGE}"'#' "${file}"
+          perl -0pi -e 's#name:\s*AGENT_VERSION,\s*value:\s*"[^"]+"#name: AGENT_VERSION,    value: "'"${AGENT_VERSION}"'"#' "${file}"
 
           if ! grep -q "image: ${IMAGE}" "${file}"; then
             echo "Failed to update ${file}" >&2
             exit 1
           fi
+          if ! grep -q "name: AGENT_VERSION,    value: \"${AGENT_VERSION}\"" "${file}"; then
+            echo "Failed to update AGENT_VERSION in ${file}" >&2
+            exit 1
+          fi
 
           cd platform-gitops
           if git diff --quiet -- apps/ai-agent.yaml; then
-            echo "GitOps image already ${IMAGE}"
+            echo "GitOps image and AGENT_VERSION already ${IMAGE}"
             exit 0
           fi
 

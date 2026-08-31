@@ -18,7 +18,7 @@ import time
 import logging
 import threading
 from contextlib import closing
-from typing import Literal, Optional
+from typing import Literal
 
 import boto3
 import psycopg2
@@ -27,6 +27,7 @@ from flask import Flask, request, jsonify
 from pgvector.psycopg2 import register_vector
 from pydantic import BaseModel, Field, ValidationError
 from kubernetes import client as k8s, config as k8s_config
+from kubernetes.client.rest import ApiException
 from kubernetes.config.config_exception import ConfigException
 
 from opentelemetry import trace as otel_trace
@@ -76,6 +77,7 @@ def configure_kubernetes():
 configure_kubernetes()
 apps_v1 = k8s.AppsV1Api()
 core_v1 = k8s.CoreV1Api()
+autoscaling_v2 = k8s.AutoscalingV2Api()
 ses = boto3.client("ses", region_name=AWS_REGION)
 
 # ---------- 綁定點十:AI 可觀測性(OTel 標準,後端由環境變數決定) ----------
@@ -112,10 +114,9 @@ log = logging.getLogger("agent")
 
 # ---------- Schema(綁定點四:不依賴模型盲從) ----------
 class RemediationAction(BaseModel):
-    action: Literal["restart", "scale", "rollback", "notify_only"]
+    action: Literal["restart", "rollback", "notify_only"]
     service: str = Field(min_length=1, max_length=63)
     reason: str = Field(min_length=1, max_length=500)
-    replicas: Optional[int] = Field(default=None, ge=1, le=10)
 
 
 def _strip_bedrock_unsupported_schema_keywords(value):
@@ -618,6 +619,44 @@ def query_dependency_health(deps):
     return " | ".join(out) or "(無相依資訊)"
 
 
+def query_hpa_status(service):
+    try:
+        hpa = autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
+            service, NAMESPACE)
+    except ApiException as exc:
+        if exc.status == 404:
+            return f"{service}: hpa=none"
+        return f"{service}: hpa_error={exc.status}"
+    except Exception as exc:
+        log.warning("HPA status query failed for %s: %s", service, exc)
+        return f"{service}: hpa_error={type(exc).__name__}"
+
+    status = hpa.status
+    spec = hpa.spec
+    conditions = []
+    for cond in status.conditions or []:
+        conditions.append(
+            f"{cond.type}={cond.status}"
+            + (f"({cond.reason})" if cond.reason else "")
+        )
+
+    metrics = []
+    for metric in status.current_metrics or []:
+        if metric.type == "Resource" and metric.resource:
+            current = metric.resource.current
+            value = current.average_utilization
+            if value is None and current.average_value:
+                value = current.average_value
+            metrics.append(f"{metric.resource.name}={value}")
+
+    return (
+        f"{service}: hpa=current={status.current_replicas} "
+        f"desired={status.desired_replicas} min={spec.min_replicas} "
+        f"max={spec.max_replicas} metrics={','.join(map(str, metrics)) or 'none'} "
+        f"conditions={','.join(conditions) or 'none'}"
+    )
+
+
 def build_log_query_url(template, service):
     """組出日誌查詢深連結,供通知信件與(未來)W4 UI 使用。
 
@@ -772,8 +811,8 @@ def call_llm(prompt, schema=None):
 JSON_RE = re.compile(r"\{.*\}", re.S)
 STRICTER = (
     "\n\n嚴格要求:只輸出一個 JSON 物件,不要任何說明文字或 markdown 圍欄。"
-    "欄位為 action(只能是 restart/scale/rollback/notify_only)、service、reason、"
-    "replicas(選填整數 1-10)。"
+    "欄位為 action(只能是 restart/rollback/notify_only)、service、reason。"
+    "不要輸出 scale 或 replicas；replicas 由 Kubernetes HPA 管理。"
 )
 
 
@@ -851,10 +890,6 @@ def remediate(act):
             {"spec": {"template": {"metadata": {"annotations": {
                 "kubectl.kubernetes.io/restartedAt":
                     time.strftime("%Y-%m-%dT%H:%M:%SZ")}}}}})
-        return True
-    if act.action == "scale":
-        apps_v1.patch_namespaced_deployment_scale(
-            act.service, NAMESPACE, {"spec": {"replicas": act.replicas or 2}})
         return True
     if act.action == "rollback":
         # 防禦性保底：正常流程在 guarded 階段就已把 rollback 改成 notify_only。
@@ -946,7 +981,8 @@ def notify_owner(meta, service, subject, body, escalate=False):
         log.error("SES send failed: %s", exc)
 
 
-def build_prompt(service, alertname, logs, similar, meta, events="", node="", deps=""):
+def build_prompt(service, alertname, logs, similar, meta,
+                 events="", node="", deps="", hpa=""):
     """組出送給模型的 prompt。
 
     v6.1:新增 events / node / deps 三個參數(皆選填,預設空字串以維持
@@ -954,6 +990,8 @@ def build_prompt(service, alertname, logs, similar, meta, events="", node="", de
     固定的證據包(方案 A),不是讓模型自己決定查什麼(方案 B) ——
     延續本文件一貫的可預測 token 成本、可完整脫敏、無迴圈失控風險
     的設計立場。
+
+    v10.5:新增 hpa 證據,replicas 由 Kubernetes HPA 管理,AI 不再做 scale。
     """
     hist = "\n".join(f"- {s}: {sm} -> {r}"
                      for s, sm, r, _ in similar) or "(無相似歷史事故)"
@@ -964,13 +1002,16 @@ def build_prompt(service, alertname, logs, similar, meta, events="", node="", de
     runbook = (f"\n該服務既有 runbook:{meta['runbook_url']}"
                if meta.get("runbook_url") else "")
     evidence = ""
-    if node or deps or events:
+    if node or deps or events or hpa:
         evidence = f"""
 節點狀態:
 {node or '(未查詢)'}
 
 相依服務狀態:
 {deps or '(未查詢)'}
+
+HPA 狀態:
+{hpa or '(未查詢)'}
 
 Kubernetes Events(最近 15 筆,通常寫明了「為什麼」):
 {events or '(未查詢)'}
@@ -987,6 +1028,9 @@ Kubernetes Events(最近 15 筆,通常寫明了「為什麼」):
 {hist}
 
 重要判斷原則:
+- replicas 由 Kubernetes HPA 管理。不要建議 scale,不要輸出 replicas。
+- HPAMaxedOut、HPAScalingInactive 或 Pending/Unschedulable 屬容量或排程問題,
+  應保留證據並 notify_only,交由平台/節點容量流程處理。
 - 若相依服務(如 postgres)本身不健康(locks 高、長交易存在),
   重啟或擴容本服務通常無效,甚至會因為重建連線而加重上游負擔 ——
   這種情況應選 notify_only。
@@ -994,8 +1038,8 @@ Kubernetes Events(最近 15 筆,通常寫明了「為什麼」):
   加機器無效 —— 應選 notify_only。
 
 只輸出一個 JSON 物件,不要任何其他文字:
-{{"action": "restart|scale|rollback|notify_only", "service": "{service}",
-  "reason": "簡短理由", "replicas": 2}}
+{{"action": "restart|rollback|notify_only", "service": "{service}",
+  "reason": "簡短理由"}}
 不確定或風險高時,一律用 notify_only。"""
 
 
@@ -1075,7 +1119,9 @@ def diagnose(alert):
             # 1b. 固定證據包:節點狀態 + 相依服務健康度(v6.1,方案 A)
             node_ev = query_node_health()
             deps_ev = query_dependency_health(meta.get("depends_on"))
-            step(iid, "evidence_gathered", {"node": node_ev, "deps": deps_ev})
+            hpa_ev = query_hpa_status(service)
+            step(iid, "evidence_gathered", {
+                "node": node_ev, "deps": deps_ev, "hpa": hpa_ev})
 
             # 2. Hybrid Search 檢索歷史(綁四)
             vec = embed(f"{alertname} {service}: {clean[:2000]}")
@@ -1094,13 +1140,13 @@ def diagnose(alert):
 
             # 3. 走 LiteLLM 判讀 + 結構化輸出約束(綁四)
             prompt = build_prompt(service, alertname, clean, similar, meta,
-                                  events=clean_events, node=node_ev, deps=deps_ev)
+                                  events=clean_events, node=node_ev,
+                                  deps=deps_ev, hpa=hpa_ev)
             act, llm = decide(prompt)
             step(iid, "judged", {
                 "model": llm["model"], "input_tokens": llm["input_tokens"],
                 "output_tokens": llm["output_tokens"],
                 "cost_usd": llm["cost_usd"], "action": act.action,
-                "replicas": getattr(act, "replicas", None),
                 "reason": act.reason})
 
             # 4. 五道降級檢查。rollback 在核心 W3 尚未實作，必須在真正
