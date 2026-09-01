@@ -11,7 +11,9 @@ ENV_DEFAULTS = {
     "PROM_URL": "http://localhost:9090",
     "PGPASSWORD": "dummy",
     "ALERT_EMAIL": "ops@example.com",
+    "ALERT_WEBHOOK_TOKEN": "dummy-alert-token",
     "AWS_REGION": "ap-northeast-1",
+    "REQUIRE_HUMAN_APPROVAL": "true",
     "SKIP_K8S_CONFIG": "true",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://localhost:4318",
     "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://localhost:4318/v1/logs",
@@ -27,6 +29,19 @@ def main() -> None:
     response = agent.app.test_client().get("/healthz")
     if response.status_code != 200:
         raise SystemExit(f"healthz failed: {response.status_code} {response.get_data(as_text=True)}")
+
+    client = agent.app.test_client()
+    response = client.post("/alert", json={"alerts": []})
+    if response.status_code != 401:
+        raise SystemExit(f"unauthorized alert accepted: {response.status_code}")
+
+    response = client.post(
+        "/alert",
+        headers={"Authorization": "Bearer dummy-alert-token"},
+        json={"alerts": []},
+    )
+    if response.status_code != 200:
+        raise SystemExit(f"authorized alert rejected: {response.status_code}")
 
     print("smoke import ok")
 

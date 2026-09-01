@@ -15,6 +15,7 @@ import os
 import re
 import json
 import time
+import hmac
 import logging
 import threading
 from contextlib import closing
@@ -52,6 +53,7 @@ ALERT_EMAIL = os.environ["ALERT_EMAIL"]          # 寄件人 + 目錄查不到�
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
 NAMESPACE = os.environ.get("TARGET_NAMESPACE", "default")
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "v6.1.3")
+ALERT_WEBHOOK_TOKEN = os.environ.get("ALERT_WEBHOOK_TOKEN", "")
 
 COOLDOWN_MIN = int(os.environ.get("COOLDOWN_MIN", "10"))
 VERIFY_WAIT = int(os.environ.get("VERIFY_WAIT_SEC", "60"))
@@ -60,6 +62,7 @@ CIRCUIT_WINDOW_MIN = int(os.environ.get("CIRCUIT_WINDOW_MIN", "15"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
 STALE_LOCK_MIN = int(os.environ.get("STALE_LOCK_MIN", "10"))
 USE_STRUCTURED = os.environ.get("USE_STRUCTURED_OUTPUT", "true").lower() == "true"
+REQUIRE_HUMAN_APPROVAL = os.environ.get("REQUIRE_HUMAN_APPROVAL", "true").lower() == "true"
 EMBED_MODEL_VERSION = os.environ.get("EMBED_MODEL_VERSION", "titan-embed-text-v2")
 
 app = Flask(__name__)
@@ -385,8 +388,42 @@ INJECTION_KEYWORDS = [
 ]
 
 
-def sanitize(text):
-    """回傳 (清乾淨的文字, 遮蔽區間, 實體數)。v7 變更(原僅回傳文字)。
+def _resource_names():
+    names = set()
+    try:
+        for dep in apps_v1.list_namespaced_deployment(NAMESPACE).items:
+            names.add(dep.metadata.name)
+    except Exception as exc:
+        log.warning("deployment allowlist query failed: %s", exc)
+    try:
+        for svc in core_v1.list_namespaced_service(NAMESPACE).items:
+            names.add(svc.metadata.name)
+    except Exception as exc:
+        log.warning("service allowlist query failed: %s", exc)
+    try:
+        for pod in core_v1.list_namespaced_pod(NAMESPACE).items:
+            names.add(pod.metadata.name)
+    except Exception as exc:
+        log.warning("pod allowlist query failed: %s", exc)
+    return {name for name in names if name}
+
+
+def _protected_ranges(text, protected_names):
+    ranges = []
+    for name in sorted((n for n in protected_names if n), key=len, reverse=True):
+        start = text.find(name)
+        while start >= 0:
+            ranges.append((start, start + len(name), name))
+            start = text.find(name, start + len(name))
+    return ranges
+
+
+def _overlaps(start, end, ranges):
+    return any(start < r_end and end > r_start for r_start, r_end, _ in ranges)
+
+
+def sanitize(text, protected_names=None):
+    """回傳 (清乾淨的文字, 遮蔽區間, 實體數, 受保護資源命中數)。
 
     偏移量刻意在替換的同時累計,而不是事後用 regex 找 [XXX] —— 日誌裡
     本來就充滿方括號([Warning]、[main]、[http-nio-8080-exec-3]),事後
@@ -404,14 +441,20 @@ def sanitize(text):
         timeout=15,
     )
     r.raise_for_status()
-    ents = sorted(r.json(), key=lambda x: -x["start"])
+    protected = set(protected_names or ()) | _resource_names()
+    protected_ranges = _protected_ranges(text, protected)
+    ents = [
+        e for e in r.json()
+        if not _overlaps(e["start"], e["end"], protected_ranges)
+    ]
+    ents = sorted(ents, key=lambda x: -x["start"])
     spans = []
     for e in ents:
         token = f"[{e['entity_type']}]"
         text = text[: e["start"]] + token + text[e["end"]:]
         spans.append({"start": e["start"], "end": e["start"] + len(token),
                       "type": e["entity_type"]})
-    return text, list(reversed(spans)), len(ents)
+    return text, list(reversed(spans)), len(ents), len(protected_ranges)
 
 
 def looks_like_injection(text):
@@ -1102,10 +1145,14 @@ def diagnose(alert):
             # v6.1:Events 的 message 欄位可能包含探針回應內容,
             # 同樣是攻擊者可影響的文字,必須跟日誌走一樣的脫敏與檢查 ——
             # 不能因為 Events 是「結構化資料」就跳過這一步。
-            clean, log_spans, log_ents = sanitize(raw_logs)
-            clean_events, evt_spans, evt_ents = sanitize(raw_events)
+            protected_names = {service, raw_name, alert_service}
+            clean, log_spans, log_ents, log_protected = sanitize(
+                raw_logs, protected_names=protected_names)
+            clean_events, evt_spans, evt_ents, evt_protected = sanitize(
+                raw_events, protected_names=protected_names)
             step(iid, "sanitized", {
                 "entities_masked": log_ents + evt_ents,
+                "protected_resource_matches": log_protected + evt_protected,
                 "masked_spans": log_spans,
                 "excerpt": clean[:500],
                 "log_query_url": build_log_query_url(
@@ -1154,6 +1201,7 @@ def diagnose(alert):
             # return False 卻仍把 action="rollback" 寫進 remediation_log，否則
             # Overview/每週統計會把「根本沒執行」的 rollback 算成自動修復。
             guard = {"target_match": True, "l2_policy": None, "tier_policy": None,
+                     "human_approval_required": REQUIRE_HUMAN_APPROVAL,
                      "circuit_open": False, "still_firing": None,
                      "downgraded_to": None, "downgraded_by": None}
 
@@ -1179,6 +1227,12 @@ def diagnose(alert):
                 act = RemediationAction(
                     action="notify_only", service=service,
                     reason=f"服務分級 tier-{meta['tier']},政策上不自動修復")
+            elif REQUIRE_HUMAN_APPROVAL:
+                guard["downgraded_to"], guard["downgraded_by"] = \
+                    "notify_only", "human_approval_required"
+                act = RemediationAction(
+                    action="notify_only", service=service,
+                    reason="需要人工核准後才可執行正式環境修復")
             elif circuit_open():
                 guard["circuit_open"] = True
                 guard["downgraded_to"], guard["downgraded_by"] = \
@@ -1262,6 +1316,15 @@ def diagnose_group(payload):
             diagnose(alert)
 
 
+def _authorized_alert_request():
+    if not ALERT_WEBHOOK_TOKEN:
+        log.error("ALERT_WEBHOOK_TOKEN is not configured; refusing alert webhook")
+        return False
+    auth = request.headers.get("Authorization", "")
+    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+    return hmac.compare_digest(token, ALERT_WEBHOOK_TOKEN)
+
+
 def worker_loop():
     """單一常駐 worker。與 v5 的差別:
        - 工作在 Postgres 裡,Pod 重啟後會被重新取出(locked_at 逾時)
@@ -1289,6 +1352,8 @@ def worker_loop():
 @app.route("/alert", methods=["POST"])
 def on_alert():
     """立刻回 200,工作排進 Postgres 佇列。"""
+    if not _authorized_alert_request():
+        return jsonify({"error": "unauthorized"}), 401
     payload = request.get_json(force=True, silent=True) or {}
     alerts = [a for a in payload.get("alerts", [])
               if a.get("status", "firing") == "firing"]

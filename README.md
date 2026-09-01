@@ -30,6 +30,14 @@ Python 3.11 environment that matches the Docker image.
 - `genai_semconv.py` isolates unstable OpenTelemetry GenAI attribute names.
 - `Dockerfile` builds the deployable agent image from `src/`.
 
+## Safety Controls
+
+- `/alert` requires `Authorization: Bearer $ALERT_WEBHOOK_TOKEN`.
+- `REQUIRE_HUMAN_APPROVAL` defaults to `true`, so model-selected remediation is
+  downgraded to notification unless an explicit approval path is added.
+- Kubernetes resource names are protected during sanitization so Pod,
+  Deployment, and Service names are not masked as PII.
+
 ## Generate Lock File
 
 ```bash
