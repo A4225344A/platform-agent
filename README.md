@@ -58,4 +58,6 @@ For a local syntax check:
 
 ```bash
 python -m py_compile src/agent.py src/genai_semconv.py
+python scripts/smoke_import.py
+python scripts/test_sanitize_resources.py
 ```
