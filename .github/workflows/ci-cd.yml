@@ -113,7 +113,9 @@ jobs:
         if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
         uses: actions/checkout@v6
         with:
-          repository: A4225344A/platform-gitops
+          # GITOPS_REPO 沒設 repo variable 時,預設用同一個 GitHub 帳號底下的
+          # platform-gitops(跟這份 repo 同 owner),讓 fork 的人不用先設變數就能跑。
+          repository: ${{ vars.GITOPS_REPO || format('{0}/platform-gitops', github.repository_owner) }}
           ref: main
           token: ${{ secrets.GITOPS_PUSH_TOKEN }}
           path: platform-gitops
