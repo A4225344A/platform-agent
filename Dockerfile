@@ -8,5 +8,8 @@ RUN python -m pip install --no-cache-dir --require-hashes -r requirements.lock \
 
 COPY src/ ./
 
+RUN useradd --system --no-create-home --uid 10001 appuser
+USER appuser
+
 EXPOSE 8080
 CMD ["python", "agent.py"]
