@@ -1370,14 +1370,18 @@ def _incident_context(incident_id):
     return {"incident": incident, "steps": steps}
 
 
-@app.route("/incidents/<int:incident_id>/ask", methods=["POST"])
+@app.route("/incidents/<int:incident_id>/ask", methods=["GET"])
 def ask_incident(incident_id):
     """唯讀 Q&A:只能根據這筆事故已存的紀錄回答,沒有任何工具呼叫能力,
-    不碰 K8s/AWS API。即使被注入攻破,最壞情況只是答錯話,不會變成執行動作。"""
+    不碰 K8s/AWS API。即使被注入攻破,最壞情況只是答錯話,不會變成執行動作。
+
+    刻意用 GET 而非 POST:CloudFront 的 /api/* 只允許 GET/HEAD/OPTIONS
+    (見主文件 §6.7/§12),用 POST 這一步在 edge 層就會被 CloudFront 原生
+    403 擋掉,連 engops-api 都碰不到。這個端點本來就是唯讀查詢,GET 語意
+    也比較誠實。"""
     if not _authorized_ask_request():
         return jsonify({"error": "unauthorized"}), 401
-    payload = request.get_json(force=True, silent=True) or {}
-    question = str(payload.get("question", "")).strip()
+    question = request.args.get("question", "").strip()
     if not question:
         return jsonify({"error": "question is required"}), 400
     if len(question) > MAX_QUESTION_LEN:

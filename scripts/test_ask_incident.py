@@ -33,38 +33,38 @@ class AskIncidentTests(unittest.TestCase):
         cls.client = agent.app.test_client()
 
     def test_rejects_missing_token(self):
-        resp = self.client.post("/incidents/1/ask", json={"question": "why?"})
+        resp = self.client.get("/incidents/1/ask", query_string={"question": "why?"})
         self.assertEqual(resp.status_code, 401)
 
     def test_rejects_wrong_token(self):
-        resp = self.client.post(
+        resp = self.client.get(
             "/incidents/1/ask",
-            json={"question": "why?"},
+            query_string={"question": "why?"},
             headers={"Authorization": "Bearer wrong-token"},
         )
         self.assertEqual(resp.status_code, 401)
 
     def test_rejects_empty_question(self):
-        resp = self.client.post(
+        resp = self.client.get(
             "/incidents/1/ask",
-            json={"question": "   "},
+            query_string={"question": "   "},
             headers={"Authorization": "Bearer dummy-ask-token"},
         )
         self.assertEqual(resp.status_code, 400)
 
     def test_rejects_oversized_question(self):
-        resp = self.client.post(
+        resp = self.client.get(
             "/incidents/1/ask",
-            json={"question": "x" * (agent.MAX_QUESTION_LEN + 1)},
+            query_string={"question": "x" * (agent.MAX_QUESTION_LEN + 1)},
             headers={"Authorization": "Bearer dummy-ask-token"},
         )
         self.assertEqual(resp.status_code, 400)
 
     def test_returns_404_when_incident_missing(self):
         with patch.object(agent, "_incident_context", return_value=None):
-            resp = self.client.post(
+            resp = self.client.get(
                 "/incidents/999/ask",
-                json={"question": "why?"},
+                query_string={"question": "why?"},
                 headers={"Authorization": "Bearer dummy-ask-token"},
             )
         self.assertEqual(resp.status_code, 404)
@@ -83,9 +83,9 @@ class AskIncidentTests(unittest.TestCase):
             patch.object(agent, "_incident_context", return_value=fake_context) as mock_context,
             patch.object(agent, "call_llm", return_value=fake_llm) as mock_call_llm,
         ):
-            resp = self.client.post(
+            resp = self.client.get(
                 "/incidents/1/ask",
-                json={"question": "why did it restart?"},
+                query_string={"question": "why did it restart?"},
                 headers={"Authorization": "Bearer dummy-ask-token"},
             )
 
