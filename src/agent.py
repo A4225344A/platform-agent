@@ -50,7 +50,8 @@ PRESIDIO_URL = os.environ["PRESIDIO_URL"]
 PROM_URL = os.environ["PROM_URL"]
 PGHOST = os.environ.get("PGHOST", "postgres")
 PGPASSWORD = os.environ["PGPASSWORD"]
-ALERT_EMAIL = os.environ["ALERT_EMAIL"]          # 寄件人 + 目錄查不到時的後備收件人
+ALERT_EMAIL = os.environ["ALERT_EMAIL"]          # 僅供信件內文標示「應通知對象」,不再是寄件人
+SNS_ALERT_TOPIC_ARN = os.environ["SNS_ALERT_TOPIC_ARN"]  # 通知改走 SNS,見 notify_owner()
 AWS_REGION = os.environ.get("AWS_REGION", "ap-northeast-1")
 NAMESPACE = os.environ.get("TARGET_NAMESPACE", "default")
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "v6.1.3")
@@ -83,7 +84,7 @@ configure_kubernetes()
 apps_v1 = k8s.AppsV1Api()
 core_v1 = k8s.CoreV1Api()
 autoscaling_v2 = k8s.AutoscalingV2Api()
-ses = boto3.client("ses", region_name=AWS_REGION)
+sns = boto3.client("sns", region_name=AWS_REGION)
 
 # ---------- 綁定點十:AI 可觀測性(OTel 標準,後端由環境變數決定) ----------
 otel_resource = Resource.create({
@@ -1018,17 +1019,32 @@ _GUARD_REASON_TEXT = {
     "alert_resolved": "準備動手前重新確認,告警已自行恢復,因此未執行任何修復動作。",
 }
 
+# SNS 的 Subject 欄位規定必須是 ASCII、不含換行、100 字元以內(RFC 2822 header),
+# 塞中文會被 SNS 靜默改成預設的 "AWS Notification Message",完全看不出是哪個服務
+# 出事——所以主旨這裡另外準備一份純英文版,豐富的中文說明留在信件內文。
+_STATUS_ASCII = {
+    "diagnose_error": "diagnose error",
+    "verify_failed": "remediation unverified",
+}
+
 
 def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
                  reason=None, verified=None, downgraded_by=None, error=None,
                  escalate=False):
-    """依服務目錄路由通知,套用常見告警信件的固定版型。
+    """發布告警通知到 SNS topic,套用常見告警信件的固定版型。
 
-    版型參考 CloudWatch/SNS、PagerDuty、Opsgenie 這類告警通知信的慣例:
-    主旨帶嚴重度前綴(依 tier 對應 SEV1~4)方便收件匣掃描;內文分
-    「摘要 / 事件詳情 / 為什麼會收到這封信 / 相關連結」四段,結尾附
-    自動化免回覆聲明。v6.1 起沿用的策略不變:log_query_url_template
+    版型參考 CloudWatch/PagerDuty/Opsgenie 這類告警通知信的慣例:主旨帶嚴重度
+    前綴(依 tier 對應 SEV1~4)方便收件匣掃描;內文分「摘要 / 事件詳情 / 為什麼
+    會收到這封信 / 相關連結」四段,結尾附自動化免回覆聲明。log_query_url_template
     只組深連結,不把日誌內容塞進信裡(見任務 3.2 / 5.0 的說明)。
+
+    改用 SNS 而非直接呼叫 SES 寄信:SES 若用 Yahoo/Gmail 這類免費信箱地址當
+    寄件人,會在任何有落實 DMARC 的收件端被拒收(SES 不是那些網域授權的寄信
+    伺服器,SPF/DKIM 無法對齊)。SNS 的通知信一律從 Amazon 自己已授權的網域
+    寄出,從不冒充使用者信箱,不觸發這個問題。代價是收件人變成「已訂閱這個
+    topic 的固定名單」,不再是依 service_catalog 動態指定的地址——owner_email/
+    escalation_email 因此改成僅列在信件內文供人工參考、追蹤誰該處理,不再是
+    實際的寄送目標。
 
     kind 決定摘要與主旨的措辭,三種:
       "awaiting_decision" — 模型 / guard 選擇 notify_only,從未動手
@@ -1051,11 +1067,19 @@ def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
         status = "需要人工決定"
         summary = "系統判讀完成但未自動執行修復,原因如下,請確認並決定後續動作。"
 
-    subject = f"[AIOps][{severity}] {service} · {alertname} — {status}"
+    # 主旨:SNS email 的 Subject 必須是純 ASCII,拿中文 status 會被 SNS
+    # 靜默換成通用的 "AWS Notification Message",所以另外查英文版本。
+    status_ascii = _STATUS_ASCII.get(kind, "needs decision")
+    subject = f"[AIOps][{severity}] {service} - {alertname} - {status_ascii}"[:100]
+
+    to = [meta.get("owner_email") or ALERT_EMAIL]
+    if escalate and meta.get("escalation_email"):
+        to.append(meta["escalation_email"])
 
     details = [
         f"服務(Service)    : {service}  [tier {tier}]",
         f"告警(Alert)      : {alertname}",
+        f"應通知對象(Route to): {', '.join(to)}",
     ]
     if action is not None:
         details.append(f"系統動作(Action)  : {action}")
@@ -1088,18 +1112,10 @@ def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
     ]
     body = "\n".join(body_parts)
 
-    to = [meta.get("owner_email") or ALERT_EMAIL]
-    if escalate and meta.get("escalation_email"):
-        to.append(meta["escalation_email"])
     try:
-        ses.send_email(
-            Source=ALERT_EMAIL,
-            Destination={"ToAddresses": to},
-            Message={"Subject": {"Data": subject},
-                     "Body": {"Text": {"Data": body}}},
-        )
+        sns.publish(TopicArn=SNS_ALERT_TOPIC_ARN, Subject=subject, Message=body)
     except Exception as exc:
-        log.error("SES send failed: %s", exc)
+        log.error("SNS publish failed: %s", exc)
 
 
 def build_prompt(service, alertname, logs, similar, meta,

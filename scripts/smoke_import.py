@@ -11,6 +11,7 @@ ENV_DEFAULTS = {
     "PROM_URL": "http://localhost:9090",
     "PGPASSWORD": "dummy",
     "ALERT_EMAIL": "ops@example.com",
+    "SNS_ALERT_TOPIC_ARN": "arn:aws:sns:ap-northeast-1:000000000000:dummy-topic",
     "ALERT_WEBHOOK_TOKEN": "dummy-alert-token",
     "AWS_REGION": "ap-northeast-1",
     "REQUIRE_HUMAN_APPROVAL": "true",
