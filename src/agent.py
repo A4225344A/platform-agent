@@ -19,6 +19,7 @@ import hmac
 import logging
 import threading
 from contextlib import closing
+from datetime import datetime, timezone
 from typing import Literal
 
 import boto3
@@ -1001,19 +1002,95 @@ def verify(deployment, wait=None, incident_id=None):
     return ok
 
 
-def notify_owner(meta, service, subject, body, escalate=False):
-    """依服務目錄路由通知。v5 永遠寄給同一個寫死的地址。
+# tier 0 是政策上「絕不自動修復」的關鍵路徑,對應最高嚴重度;tier 3 最低。
+# 嚴重度標籤放主旨最前面,讓收件人在信件列表就能分輕重,不必點開才知道。
+_TIER_SEVERITY = {0: "SEV1", 1: "SEV2", 2: "SEV3", 3: "SEV4"}
 
-    v6.1:若服務目錄有 log_query_url_template,信件附上『查完整日誌』
-    的深連結 —— 這是本文件對日誌採取的策略(不儲存,只留連結)
-    在通知路徑上的落地,見任務 3.2 / 5.0 的說明。
+# 對應 diagnose() 裡 guard["downgraded_by"] 的代碼 -> 給人看的一句話原因。
+# 沒有中文化以前,收件人只看得到像 "human_approval_required" 這種內部代號,
+# 等於還是要回頭問工程師「這封信到底在說什麼」。
+_GUARD_REASON_TEXT = {
+    "target_mismatch": "模型判讀鎖定的服務與告警來源不符,系統已攔截並改為僅通知,不執行任何動作。",
+    "l2_not_implemented": "模型建議的動作是高風險的 rollback;目前僅支援走 GitOps 核准流程執行,不會自動執行,已降級為通知。",
+    "tier_policy": "此服務的分級政策不允許自動修復,已改為僅通知。",
+    "human_approval_required": "系統設定為所有修復都需要人工核准後才會執行,已改為通知並等待您的決定。",
+    "circuit_breaker": "近期同叢集已達自動修復次數上限(斷路器開啟),為避免修復風暴已改為僅通知。",
+    "alert_resolved": "準備動手前重新確認,告警已自行恢復,因此未執行任何修復動作。",
+}
+
+
+def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
+                 reason=None, verified=None, downgraded_by=None, error=None,
+                 escalate=False):
+    """依服務目錄路由通知,套用常見告警信件的固定版型。
+
+    版型參考 CloudWatch/SNS、PagerDuty、Opsgenie 這類告警通知信的慣例:
+    主旨帶嚴重度前綴(依 tier 對應 SEV1~4)方便收件匣掃描;內文分
+    「摘要 / 事件詳情 / 為什麼會收到這封信 / 相關連結」四段,結尾附
+    自動化免回覆聲明。v6.1 起沿用的策略不變:log_query_url_template
+    只組深連結,不把日誌內容塞進信裡(見任務 3.2 / 5.0 的說明)。
+
+    kind 決定摘要與主旨的措辭,三種:
+      "awaiting_decision" — 模型 / guard 選擇 notify_only,從未動手
+      "verify_failed"     — 已嘗試修復,但 verify() 沒有通過
+      "diagnose_error"    — 判讀流程本身拋出例外
     """
+    tier = meta.get("tier", 0)
+    severity = _TIER_SEVERITY.get(tier, "SEV?")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    why = _GUARD_REASON_TEXT.get(downgraded_by) or reason or None
+
+    if kind == "diagnose_error":
+        status = "判讀流程發生例外"
+        summary = "自動判讀流程在完成前發生例外,尚未確定是否需要處理,請人工確認。"
+        why = why or error
+    elif kind == "verify_failed":
+        status = "已嘗試修復,但驗證未通過"
+        summary = f"系統已自動執行 {action},但事後檢查服務未回到 Ready,需要人工介入。"
+    else:
+        status = "需要人工決定"
+        summary = "系統判讀完成但未自動執行修復,原因如下,請確認並決定後續動作。"
+
+    subject = f"[AIOps][{severity}] {service} · {alertname} — {status}"
+
+    details = [
+        f"服務(Service)    : {service}  [tier {tier}]",
+        f"告警(Alert)      : {alertname}",
+    ]
+    if action is not None:
+        details.append(f"系統動作(Action)  : {action}")
+    if verified is not None:
+        details.append(f"驗證結果(Verified): {verified}")
+    if error is not None:
+        details.append(f"錯誤內容(Error)   : {error}")
+    details += [
+        f"時間(UTC)        : {now}",
+        f"追蹤 ID(Trace)   : {trace_id}",
+    ]
+
+    body_parts = [summary, "", "-- 事件詳情 " + "-" * 40, *details]
+    if why:
+        body_parts += ["", "-- 為什麼會收到這封信 " + "-" * 32, why]
+
+    log_url = build_log_query_url(meta.get("log_query_url_template"), service)
+    links = []
+    if meta.get("runbook_url"):
+        links.append(f"Runbook  : {meta['runbook_url']}")
+    if log_url:
+        links.append(f"完整日誌 : {log_url}")
+    if links:
+        body_parts += ["", "-- 相關連結 " + "-" * 40, *links]
+
+    body_parts += [
+        "",
+        "-" * 52,
+        "此為 W3 AI SRE Agent 自動發出的通知信,請勿直接回覆此地址。",
+    ]
+    body = "\n".join(body_parts)
+
     to = [meta.get("owner_email") or ALERT_EMAIL]
     if escalate and meta.get("escalation_email"):
         to.append(meta["escalation_email"])
-    log_url = build_log_query_url(meta.get("log_query_url_template"), service)
-    if log_url:
-        body = f"{body}\n\n完整日誌:{log_url}"
     try:
         ses.send_email(
             Source=ALERT_EMAIL,
@@ -1285,9 +1362,10 @@ def diagnose(alert):
 
             if not acted or ok is False:
                 notify_owner(
-                    meta, service, f"[AIOps] {service} 需要人工介入",
-                    f"alert={alertname}\naction={act.action}\n"
-                    f"reason={act.reason}\nverified={ok}\ntrace={trace_id}",
+                    meta, service, alertname, trace_id,
+                    kind="awaiting_decision" if not acted else "verify_failed",
+                    action=act.action, reason=act.reason, verified=ok,
+                    downgraded_by=guard.get("downgraded_by"),
                     escalate=(meta["tier"] <= 1))
             log.info("done %s/%s action=%s verified=%s outcome=%s",
                      alertname, service, act.action, ok, outcome)
@@ -1299,8 +1377,8 @@ def diagnose(alert):
             # 中斷(timeline_stale),同時涵蓋這兩種情況;'failed' 只涵蓋一種。
             step(iid, "failed", {"error": str(exc)[:300]})
             log.exception("diagnose failed for %s", service)
-            notify_owner(meta, service, f"[AIOps] {service} 判讀流程異常",
-                         f"alert={alertname},請查 ai-agent 日誌\ntrace={trace_id}")
+            notify_owner(meta, service, alertname, trace_id,
+                         kind="diagnose_error", error=str(exc)[:300])
 
 
 def diagnose_group(payload):
