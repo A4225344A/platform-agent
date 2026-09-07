@@ -44,7 +44,7 @@ jobs:
         run: pip-audit --cache-dir .pip-audit-cache -r requirements.lock
 
       - name: Compile Python files
-        run: python -m py_compile src/agent.py src/genai_semconv.py scripts/smoke_import.py scripts/test_sanitize_resources.py scripts/test_ask_incident.py eval_judge.py
+        run: python -m py_compile src/agent.py src/genai_semconv.py scripts/smoke_import.py scripts/test_sanitize_resources.py scripts/test_ask_incident.py scripts/test_notifications.py eval_judge.py
 
       - name: Import smoke test
         run: python scripts/smoke_import.py
@@ -54,6 +54,9 @@ jobs:
 
       - name: Ask-incident endpoint regression test
         run: python scripts/test_ask_incident.py
+
+      - name: Notification email content regression test
+        run: python scripts/test_notifications.py
 
   docker:
     name: Build And Publish Image
