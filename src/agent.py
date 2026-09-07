@@ -85,6 +85,7 @@ configure_kubernetes()
 apps_v1 = k8s.AppsV1Api()
 core_v1 = k8s.CoreV1Api()
 autoscaling_v2 = k8s.AutoscalingV2Api()
+batch_v1 = k8s.BatchV1Api()
 sns = boto3.client("sns", region_name=AWS_REGION)
 
 # ---------- 綁定點十:AI 可觀測性(OTel 標準,後端由環境變數決定) ----------
@@ -597,6 +598,72 @@ def fetch_events(deployment):
         return f"event read failed: {exc}"
 
 
+def _alert_namespace(labels):
+    return labels.get("namespace") or NAMESPACE
+
+
+def _job_name(labels, fallback):
+    return labels.get("job_name") or labels.get("job") or fallback
+
+
+def fetch_job_logs(job, namespace, tail_lines=100):
+    try:
+        # Read the Job first so a missing/wrong namespace produces a direct signal.
+        batch_v1.read_namespaced_job(job, namespace)
+        pods = core_v1.list_namespaced_pod(
+            namespace, label_selector=f"job-name={job}").items
+        if not pods:
+            return f"no pods found for job {job} in namespace {namespace}"
+        chunks = []
+        for pod in pods[:3]:
+            pod_name = pod.metadata.name
+            try:
+                pod_log = core_v1.read_namespaced_pod_log(
+                    pod_name, namespace, tail_lines=tail_lines)
+                chunks.append(f"== pod/{pod_name} ==\n{pod_log}")
+            except Exception as exc:
+                chunks.append(f"pod log read failed for {pod_name}: {exc}")
+        return "\n\n".join(chunks)
+    except Exception as exc:
+        return f"job log read failed for {job} in namespace {namespace}: {exc}"
+
+
+def fetch_job_events(job, namespace):
+    try:
+        pods = core_v1.list_namespaced_pod(
+            namespace, label_selector=f"job-name={job}").items
+        names = {p.metadata.name for p in pods} | {job}
+        evts = core_v1.list_namespaced_event(namespace).items
+        rows = []
+        for e in evts:
+            obj = e.involved_object
+            if obj.name in names or (obj.name or "").startswith(job + "-"):
+                rows.append((e.last_timestamp or e.event_time, e.type,
+                             e.reason, (e.message or "")[:160]))
+        rows.sort(key=lambda r: (r[0] is not None, r[0]), reverse=True)
+        if not rows:
+            return f"(無 job/{job} 相關 Kubernetes Events)"
+        return "\n".join(
+            f"[{at}] {event_type}/{reason}: {msg}"
+            for at, event_type, reason, msg in rows[:15]
+        )
+    except Exception as exc:
+        return f"job event read failed for {job} in namespace {namespace}: {exc}"
+
+
+def fetch_logs_for_alert(alertname, service, labels, tail_lines=100, previous=False):
+    if alertname == "KubeJobFailed":
+        return fetch_job_logs(_job_name(labels, service), _alert_namespace(labels),
+                              tail_lines=tail_lines)
+    return fetch_logs(service, tail_lines=tail_lines, previous=previous)
+
+
+def fetch_events_for_alert(alertname, service, labels):
+    if alertname == "KubeJobFailed":
+        return fetch_job_events(_job_name(labels, service), _alert_namespace(labels))
+    return fetch_events(service)
+
+
 NODE_QUERIES = {
     "cpu_pct":       '100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)',
     "steal_pct":     'avg(rate(node_cpu_seconds_total{mode="steal"}[5m])) * 100',
@@ -1045,36 +1112,100 @@ def _incident_url(incident_id):
     return f"{ENGOPS_UI_URL}/incidents/{incident_id}"
 
 
-def _recommendation(kind, action, reason, downgraded_by, error):
+def _format_alert_labels(labels):
+    if not labels:
+        return "(本次通知沒有收到 Alertmanager labels)"
+    preferred = (
+        "alertname", "namespace", "job_name", "job", "service",
+        "pod", "container", "severity", "instance",
+    )
+    lines = []
+    seen = set()
+    for key in preferred:
+        if labels.get(key):
+            lines.append(f"{key}: {labels[key]}")
+            seen.add(key)
+    for key in sorted(k for k in labels if k not in seen)[:12]:
+        lines.append(f"{key}: {labels[key]}")
+    return "\n".join(lines) if lines else "(Alertmanager labels 皆為空值)"
+
+
+def _read_only_kubectl_hints(alertname, labels, service):
+    namespace = labels.get("namespace") or NAMESPACE
+    if alertname == "KubeJobFailed":
+        job = labels.get("job_name") or labels.get("job") or service
+        return [
+            "讀取型查詢可先用下面兩個方向確認現況:",
+            f"kubectl -n {namespace} describe job {job}",
+            f"kubectl -n {namespace} get pods -l job-name={job}",
+        ]
+    return []
+
+
+def _human_action_steps(alertname, service, labels, downgraded_by):
+    namespace = labels.get("namespace") or NAMESPACE
+    if alertname == "KubeJobFailed":
+        job = labels.get("job_name") or labels.get("job") or service
+        lines = [
+            f"1. 先確認失敗的是 Kubernetes Job `{job}`，namespace 是 `{namespace}`。這類告警不是 Deployment 故障，不能用重啟 Deployment 當主要解法。",
+            "2. 查看 Job 的 Events 與 failed Pod，判斷是 BackoffLimitExceeded、ImagePullBackOff、RBAC 權限、資源不足、DeadlineExceeded，還是一次性 Job 的歷史失敗狀態。",
+            "3. 如果 Job 仍在反覆失敗，請修正 Job/CronJob template、映像、權限或資源設定後再重跑；如果只是舊的 failed Job 殘留，請由 owner 決定是否清理失敗 Job 或等待監控指標消退。",
+            "4. 若這是 kube-prometheus-stack/kube-state-metrics 相關 Job，優先檢查 Helm/GitOps 設定與 monitoring namespace 的 Job/CronJob，不要只查 default namespace 的 Deployment。",
+        ]
+    else:
+        lines = [
+            f"1. 先確認 `{service}` 的告警是否仍在 firing，並比對下方 logs/events 是否指向同一個問題。",
+            "2. 依 AI 原始建議與 Runbook 判斷是否要重啟、rollback、調整設定，或交由平台容量/基礎設施流程處理。",
+            "3. 處置後回到事故頁確認狀態、補上處置紀錄，讓後續相似事故可被 RAG 使用。",
+        ]
+    if downgraded_by:
+        lines.append("注意:本次系統保護機制阻止自動執行；人工處置前請確認這個限制是否仍適用。")
+    lines += _read_only_kubectl_hints(alertname, labels, service)
+    return "\n".join(lines)
+
+
+def _recommendation(kind, alertname, service, action, reason, downgraded_by,
+                    error, *, model_action=None, model_reason=None,
+                    alert_labels=None):
     guard_text = _GUARD_REASON_TEXT.get(downgraded_by)
+    labels = alert_labels or {}
     if kind == "diagnose_error":
-        return (
-            "請先由值班者檢查 AI Agent、Kubernetes API、Presidio、LiteLLM 與資料庫是否正常。"
-            "下方錯誤內容與 logs/events 摘錄可作為第一輪判斷依據。"
-            f"\n判讀錯誤: {error}" if error else
-            "請先由值班者檢查 AI Agent、Kubernetes API、Presidio、LiteLLM 與資料庫是否正常。"
-        )
+        lines = [
+            "請先由值班者檢查 AI Agent、Kubernetes API、Presidio、LiteLLM 與資料庫是否正常。",
+            "下方錯誤內容與 logs/events 摘錄可作為第一輪判斷依據。",
+        ]
+        if error:
+            lines.append(f"判讀錯誤: {error}")
     if kind == "verify_failed":
         lines = [
             f"系統已嘗試執行 {action or '修復動作'},但驗證沒有通過,請人工接手。",
             "建議先確認服務是否仍不 Ready,再依 Runbook 決定是否 rollback、重啟或交由平台容量流程處理。",
         ]
-    else:
+    elif kind != "diagnose_error":
         lines = [
             "本次沒有自動修復,請 owner 依下方證據與 Runbook 判斷是否要人工處置。",
-            f"AI 建議動作: {action or 'notify_only'}",
+            f"AI 原始建議: {model_action or action or 'notify_only'}",
+            f"系統最後動作: {action or 'notify_only'}",
         ]
-    if reason:
+    if model_reason:
+        lines.append(f"AI 原始理由: {model_reason}")
+    elif reason:
         lines.append(f"AI 判斷理由: {reason}")
+    if reason and model_reason and reason != model_reason:
+        lines.append(f"系統改判理由: {reason}")
     if guard_text:
         lines.append(f"系統保護判斷: {guard_text}")
+    lines.append("")
+    lines.append("人工處置步驟:")
+    lines.append(_human_action_steps(alertname, service, labels, downgraded_by))
     return "\n".join(lines)
 
 
 def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
                  reason=None, verified=None, downgraded_by=None, error=None,
                  escalate=False, incident_id=None, log_excerpt=None,
-                 events_excerpt=None):
+                 events_excerpt=None, alert_labels=None, model_action=None,
+                 model_reason=None):
     """發布告警通知到 SNS topic,套用常見告警信件的固定版型。
 
     版型參考 CloudWatch/PagerDuty/Opsgenie 這類告警通知信的慣例:主旨帶嚴重度
@@ -1136,7 +1267,10 @@ def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
         f"追蹤 ID(Trace)   : {trace_id}",
     ]
 
-    recommendation = _recommendation(kind, action, reason, downgraded_by, error)
+    recommendation = _recommendation(
+        kind, alertname, service, action, reason, downgraded_by, error,
+        model_action=model_action, model_reason=model_reason,
+        alert_labels=alert_labels)
 
     body_parts = [
         summary,
@@ -1146,6 +1280,9 @@ def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
         "",
         "-- 事件詳情 " + "-" * 40,
         *details,
+        "",
+        "-- 告警標籤 " + "-" * 40,
+        _format_alert_labels(alert_labels),
     ]
     if why:
         body_parts += ["", "-- 為什麼會收到這封信 " + "-" * 32, why]
@@ -1298,18 +1435,22 @@ def diagnose(alert):
             # CrashLoop 最有價值的通常是「上一個已終止 container」的最後幾行。
             # previous log 不存在時 Kubernetes API 會報錯，這時再退回 current log。
             if alertname == "PodCrashLooping":
-                raw_logs = fetch_logs(service, previous=True)
+                raw_logs = fetch_logs_for_alert(
+                    alertname, service, labels, previous=True)
                 if raw_logs.startswith("log read failed"):
-                    raw_logs = fetch_logs(service)
+                    raw_logs = fetch_logs_for_alert(alertname, service, labels)
             else:
-                raw_logs = fetch_logs(service)
-            raw_events = fetch_events(service)          # v6.1
+                raw_logs = fetch_logs_for_alert(alertname, service, labels)
+            raw_events = fetch_events_for_alert(alertname, service, labels)  # v6.1
 
             # 1. 應用層脫敏 + 注入檢查(綁九)
             # v6.1:Events 的 message 欄位可能包含探針回應內容,
             # 同樣是攻擊者可影響的文字,必須跟日誌走一樣的脫敏與檢查 ——
             # 不能因為 Events 是「結構化資料」就跳過這一步。
-            protected_names = {service, raw_name, alert_service}
+            protected_names = {
+                service, raw_name, alert_service,
+                labels.get("job_name"), labels.get("job"), labels.get("namespace"),
+            }
             clean, log_spans, log_ents, log_protected = sanitize(
                 raw_logs, protected_names=protected_names)
             clean_events, evt_spans, evt_ents, evt_protected = sanitize(
@@ -1354,6 +1495,8 @@ def diagnose(alert):
                                   events=clean_events, node=node_ev,
                                   deps=deps_ev, hpa=hpa_ev)
             act, llm = decide(prompt)
+            model_action = act.action
+            model_reason = act.reason
             step(iid, "judged", {
                 "model": llm["model"], "input_tokens": llm["input_tokens"],
                 "output_tokens": llm["output_tokens"],
@@ -1453,7 +1596,9 @@ def diagnose(alert):
                     action=act.action, reason=act.reason, verified=ok,
                     downgraded_by=guard.get("downgraded_by"),
                     escalate=(meta["tier"] <= 1), incident_id=iid,
-                    log_excerpt=clean, events_excerpt=clean_events)
+                    log_excerpt=clean, events_excerpt=clean_events,
+                    alert_labels=labels, model_action=model_action,
+                    model_reason=model_reason)
             log.info("done %s/%s action=%s verified=%s outcome=%s",
                      alertname, service, act.action, ok, outcome)
         except Exception as exc:
@@ -1467,7 +1612,7 @@ def diagnose(alert):
             notify_owner(meta, service, alertname, trace_id,
                          kind="diagnose_error", error=str(exc)[:300],
                          incident_id=iid, log_excerpt=clean,
-                         events_excerpt=clean_events)
+                         events_excerpt=clean_events, alert_labels=labels)
 
 
 def diagnose_group(payload):

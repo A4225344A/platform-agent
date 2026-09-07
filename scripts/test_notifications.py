@@ -49,17 +49,34 @@ class NotificationTests(unittest.TestCase):
                 "trace-123",
                 kind="awaiting_decision",
                 action="notify_only",
-                reason="Kubernetes Job failed and tier policy blocks auto remediation",
+                reason="服務分級 tier-0,政策上不自動修復",
                 downgraded_by="tier_policy",
                 incident_id=42,
                 log_excerpt="job failed: BackoffLimitExceeded",
                 events_excerpt="Warning BackoffLimitExceeded Job has reached the specified backoff limit",
+                alert_labels={
+                    "alertname": "KubeJobFailed",
+                    "namespace": "monitoring",
+                    "job_name": "kps-kube-state-metrics",
+                    "service": "kps-kube-state-metrics",
+                },
+                model_action="notify_only",
+                model_reason="Kubernetes Job failed with BackoffLimitExceeded",
                 escalate=True,
             )
 
         message = publish.call_args.kwargs["Message"]
         self.assertIn("-- 建議處置", message)
-        self.assertIn("AI 判斷理由: Kubernetes Job failed", message)
+        self.assertIn("AI 原始建議: notify_only", message)
+        self.assertIn("系統最後動作: notify_only", message)
+        self.assertIn("AI 原始理由: Kubernetes Job failed", message)
+        self.assertIn("系統改判理由: 服務分級 tier-0", message)
+        self.assertIn("人工處置步驟:", message)
+        self.assertIn("先確認失敗的是 Kubernetes Job", message)
+        self.assertIn("kubectl -n monitoring describe job kps-kube-state-metrics", message)
+        self.assertIn("-- 告警標籤", message)
+        self.assertIn("namespace: monitoring", message)
+        self.assertIn("job_name: kps-kube-state-metrics", message)
         self.assertIn("-- 原始證據(已脫敏摘錄)", message)
         self.assertIn("原始 logs:", message)
         self.assertIn("job failed: BackoffLimitExceeded", message)
