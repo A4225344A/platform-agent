@@ -57,6 +57,7 @@ NAMESPACE = os.environ.get("TARGET_NAMESPACE", "default")
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "v6.1.3")
 ALERT_WEBHOOK_TOKEN = os.environ.get("ALERT_WEBHOOK_TOKEN", "")
 ASK_TOKEN = os.environ.get("ASK_TOKEN", "")      # engops-api 專用,跟 ALERT_WEBHOOK_TOKEN 分開,職責不同
+ENGOPS_UI_URL = os.environ.get("ENGOPS_UI_URL", "").strip().rstrip("/")
 
 COOLDOWN_MIN = int(os.environ.get("COOLDOWN_MIN", "10"))
 VERIFY_WAIT = int(os.environ.get("VERIFY_WAIT_SEC", "60"))
@@ -1028,15 +1029,58 @@ _STATUS_ASCII = {
 }
 
 
+def _email_excerpt(text, *, limit=1800, empty="(本次沒有取得可顯示的內容)"):
+    """把通知信中的證據限制在可讀長度,完整內容仍交給 log 深連結。"""
+    value = (text or "").strip()
+    if not value:
+        return empty
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "\n... (內容過長已截斷,請開完整日誌查看)"
+
+
+def _incident_url(incident_id):
+    if not ENGOPS_UI_URL or incident_id is None:
+        return None
+    return f"{ENGOPS_UI_URL}/incidents/{incident_id}"
+
+
+def _recommendation(kind, action, reason, downgraded_by, error):
+    guard_text = _GUARD_REASON_TEXT.get(downgraded_by)
+    if kind == "diagnose_error":
+        return (
+            "請先由值班者檢查 AI Agent、Kubernetes API、Presidio、LiteLLM 與資料庫是否正常。"
+            "下方錯誤內容與 logs/events 摘錄可作為第一輪判斷依據。"
+            f"\n判讀錯誤: {error}" if error else
+            "請先由值班者檢查 AI Agent、Kubernetes API、Presidio、LiteLLM 與資料庫是否正常。"
+        )
+    if kind == "verify_failed":
+        lines = [
+            f"系統已嘗試執行 {action or '修復動作'},但驗證沒有通過,請人工接手。",
+            "建議先確認服務是否仍不 Ready,再依 Runbook 決定是否 rollback、重啟或交由平台容量流程處理。",
+        ]
+    else:
+        lines = [
+            "本次沒有自動修復,請 owner 依下方證據與 Runbook 判斷是否要人工處置。",
+            f"AI 建議動作: {action or 'notify_only'}",
+        ]
+    if reason:
+        lines.append(f"AI 判斷理由: {reason}")
+    if guard_text:
+        lines.append(f"系統保護判斷: {guard_text}")
+    return "\n".join(lines)
+
+
 def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
                  reason=None, verified=None, downgraded_by=None, error=None,
-                 escalate=False):
+                 escalate=False, incident_id=None, log_excerpt=None,
+                 events_excerpt=None):
     """發布告警通知到 SNS topic,套用常見告警信件的固定版型。
 
     版型參考 CloudWatch/PagerDuty/Opsgenie 這類告警通知信的慣例:主旨帶嚴重度
     前綴(依 tier 對應 SEV1~4)方便收件匣掃描;內文分「摘要 / 事件詳情 / 為什麼
-    會收到這封信 / 相關連結」四段,結尾附自動化免回覆聲明。log_query_url_template
-    只組深連結,不把日誌內容塞進信裡(見任務 3.2 / 5.0 的說明)。
+    會收到這封信 / 證據摘錄 / 相關連結」幾段,結尾附自動化免回覆聲明。
+    信件內只放已脫敏摘錄,完整內容由 log_query_url_template 組深連結。
 
     改用 SNS 而非直接呼叫 SES 寄信:SES 若用 Yahoo/Gmail 這類免費信箱地址當
     寄件人,會在任何有落實 DMARC 的收件端被拒收(SES 不是那些網域授權的寄信
@@ -1092,18 +1136,42 @@ def notify_owner(meta, service, alertname, trace_id, *, kind, action=None,
         f"追蹤 ID(Trace)   : {trace_id}",
     ]
 
-    body_parts = [summary, "", "-- 事件詳情 " + "-" * 40, *details]
+    recommendation = _recommendation(kind, action, reason, downgraded_by, error)
+
+    body_parts = [
+        summary,
+        "",
+        "-- 建議處置 " + "-" * 40,
+        recommendation,
+        "",
+        "-- 事件詳情 " + "-" * 40,
+        *details,
+    ]
     if why:
         body_parts += ["", "-- 為什麼會收到這封信 " + "-" * 32, why]
 
+    body_parts += [
+        "",
+        "-- 原始證據(已脫敏摘錄) " + "-" * 30,
+        "原始 logs:",
+        _email_excerpt(log_excerpt),
+        "",
+        "Kubernetes Events:",
+        _email_excerpt(events_excerpt, limit=1200, empty="(本次沒有取得 Kubernetes Events 摘錄)"),
+    ]
+
     log_url = build_log_query_url(meta.get("log_query_url_template"), service)
+    incident_url = _incident_url(incident_id)
     links = []
+    if incident_url:
+        links.append(f"事故頁面 : {incident_url}")
+    else:
+        links.append("事故頁面 : 尚未設定 ENGOPS_UI_URL,無法產生網站網址")
     if meta.get("runbook_url"):
         links.append(f"Runbook  : {meta['runbook_url']}")
     if log_url:
         links.append(f"完整日誌 : {log_url}")
-    if links:
-        body_parts += ["", "-- 相關連結 " + "-" * 40, *links]
+    body_parts += ["", "-- 相關連結 " + "-" * 40, *links]
 
     body_parts += [
         "",
@@ -1224,6 +1292,8 @@ def diagnose(alert):
         step(iid, "queued", {"cooldown": False, "group_dedup": True,
                              "tier": meta["tier"],
                              "auto_remediate": meta["auto_remediate"]})
+        clean = ""
+        clean_events = ""
         try:
             # CrashLoop 最有價值的通常是「上一個已終止 container」的最後幾行。
             # previous log 不存在時 Kubernetes API 會報錯，這時再退回 current log。
@@ -1382,7 +1452,8 @@ def diagnose(alert):
                     kind="awaiting_decision" if not acted else "verify_failed",
                     action=act.action, reason=act.reason, verified=ok,
                     downgraded_by=guard.get("downgraded_by"),
-                    escalate=(meta["tier"] <= 1))
+                    escalate=(meta["tier"] <= 1), incident_id=iid,
+                    log_excerpt=clean, events_excerpt=clean_events)
             log.info("done %s/%s action=%s verified=%s outcome=%s",
                      alertname, service, act.action, ok, outcome)
         except Exception as exc:
@@ -1394,7 +1465,9 @@ def diagnose(alert):
             step(iid, "failed", {"error": str(exc)[:300]})
             log.exception("diagnose failed for %s", service)
             notify_owner(meta, service, alertname, trace_id,
-                         kind="diagnose_error", error=str(exc)[:300])
+                         kind="diagnose_error", error=str(exc)[:300],
+                         incident_id=iid, log_excerpt=clean,
+                         events_excerpt=clean_events)
 
 
 def diagnose_group(payload):
